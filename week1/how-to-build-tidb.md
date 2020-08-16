@@ -13,6 +13,7 @@
     - [修改事务声明代码](#修改事务声明代码)
   - [后验总结](#后验总结)
     - [分布式事务相关](#分布式事务相关)
+    - [疑问](#疑问)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -61,6 +62,7 @@ ERROR 2003 (HY000): Can't connect to MySQL server on '127.0.0.1' (61)
 快速启动 tidb 集群的命令行
 ```
 tiup playground v4.0.0 --db 1 --pd 1 --kv 3 --monitor
+tiup playground cleanup
 ```
 
 ### 编译组件
@@ -109,6 +111,87 @@ make -j8
 从理论上分析，TiKV 本身是一个分布式一致性 db，并且有 MVCC 和事务抽象，则向上应该提供了
 简单的事务提交接口供无状态的 sql server 调用，我们只需要找到那个位置即可，在这一步应该忽略具体事务的实现，先专注找到调用事务的位置，集中位置应该是 tidb 项目目录内，同时我们也应该意识到，我们每次为了验证维护稳定，只需要 tiup 内替换 tidb-server 即可。
 
+最新的启动命令
+```
+tiup playground v4.0.0 --db 1 --pd 1 --kv 3 --tiflash 0 --monitor --db.binpath [your bin path]
+```
+我们使用下列的 tidb transaction 语句，并观察日志。参考了[这篇文档](https://docs.pingcap.com/zh/tidb/stable/transaction-overview)。
+```sql
+set autocommit = 0;
+CREATE TABLE T (I INT KEY);
+INSERT INTO T VALUES (1);
+BEGIN;
+INSERT INTO T VALUES (1); -- MySQL 返回错误；TiDB 返回成功
+INSERT INTO T VALUES (2);
+COMMIT; -- MySQL 提交成功；TiDB 返回错误，事务回滚
+SELECT * FROM T; -- MySQL 返回 1 2；TiDB 返回 1
+```
+
+一开始执行的时候发现，提交后表现和文档内所展示的不太一样，比如 insert 1 后会立刻报错。仔细阅读文档后发现这篇的功能前提都基于乐观锁模型，而在后面的乐观事务文档内写到最新版本的数据会默认开启悲观事务模型。（文档可以改进）
+
+在我们的目标内，我们其实是希望找到 BEGIN 语句的执行流程, 用哪种模型暂时和目标无关，应该选择能产生更多日志的链路方便抓到更多线索，理论上看悲观模型更合适。
+
+在 tidb 内的日志中，观察到比较重要的相关日志：
+```
+[2020/08/16 14:23:34.728 +08:00] [INFO] [session.go:1413] ["NewTxn() inside a transaction auto commit"] [conn=3] [schemaVersion=24] [txnStartTS=418790497694253057]
+[2020/08/16 14:24:32.659 +08:00] [ERROR] [conn.go:728] ["command dispatched failed"] [conn=3] [connInfo="id:3, addr:127.0.0.1:50011 status:1, collation:utf8mb4_0900_ai_ci, user:root"] [command=Query] [status="inTxn:1, autocommit:0"] [sql="INSERT INTO T VALUES (1)"] [txn_mode=PESSIMISTIC] [err="[kv:1062]Duplicate entry '1' for key 'PRIMARY'"]
+```
+
+提示我们 session.go 和 conn.go 内和执行流程相关的信息比较多, 可以重点看一下这两块的代码。
+
+追溯代码中发现 session/txn.go 描述了事务结构，也比较重要。而且通过事务概述的文章可以得知，sql server 在执行事务的时候会把相关语句放在 sql server 本 session 的上下文内，则应该可以找到类似的代码。
+
+查看代码后比较相关的代码感觉有如下：
+```go
+// session.go  
+func (s *session) PrepareTxnCtx(ctx context.Context) {...}
+func (s *session) NewTxn(ctx context.Context) error {...}
+```
+
+在两处起点添加日志代码后重新编译 tidb 并执行语句观察日志.
+```
+[2020/08/16 15:25:38.906 +08:00] [INFO] [session.go:2123] ["CRUCIAL OPERATION"] [conn=3] [schemaVersion=22] [cur_db=test] [sql="CREATE TABLE T (I INT KEY)"] [user=root@127.0.0.1]
+[2020/08/16 15:25:38.906 +08:00] [INFO] [session.go:1406] ["hello transaction for NewTXN"] [conn=3]
+[2020/08/16 15:25:38.911 +08:00] [INFO] [ddl_worker.go:253] ["[ddl] add DDL jobs"] ["batch count"=1] [jobs="ID:46, Type:create table, State:none, SchemaState:none, SchemaID:1, TableID:45, RowCount:0, ArgLen:1, start time: 2020-08-16 15:25:38.903 +0800 CST, Err:<nil>, ErrCount:0, SnapshotVersion:0; "]
+[2020/08/16 15:25:38.911 +08:00] [INFO] [ddl.go:500] ["[ddl] start DDL job"] [job="ID:46, Type:create table, State:none, SchemaState:none, SchemaID:1, TableID:45, RowCount:0, ArgLen:1, start time: 2020-08-16 15:25:38.903 +0800 CST, Err:<nil>, ErrCount:0, SnapshotVersion:0"] [query="CREATE TABLE T (I INT KEY)"]
+[2020/08/16 15:25:38.913 +08:00] [INFO] [ddl_worker.go:568] ["[ddl] run DDL job"] [worker="worker 3, tp general"] [job="ID:46, Type:create table, State:none, SchemaState:none, SchemaID:1, TableID:45, RowCount:0, ArgLen:0, start time: 2020-08-16 15:25:38.903 +0800 CST, Err:<nil>, ErrCount:0, SnapshotVersion:0"]
+[2020/08/16 15:25:38.914 +08:00] [INFO] [session.go:2032] ["hello transaction for PrepareTxnCtx"]
+[2020/08/16 15:25:38.914 +08:00] [INFO] [session.go:2032] ["hello transaction for PrepareTxnCtx"]
+[2020/08/16 15:25:38.914 +08:00] [INFO] [session.go:2032] ["hello transaction for PrepareTxnCtx"]
+[2020/08/16 15:25:38.915 +08:00] [INFO] [session.go:2032] ["hello transaction for PrepareTxnCtx"]
+```
+
+追踪日志看到 PrepareTxnCtx 在很多位置都调用到，应该加的位置不对产生很多噪音日志，后面的是对的，重新来一次（执行上述语句序列）。
+
+只有在第一句执行语句的时候才会出现，不符合预期。
+```
+[2020/08/16 15:50:03.110 +08:00] [INFO] [session.go:1406] ["hello transaction for NewTXN"] [conn=3]
+```
+
+对整体流程的执行还是有点误解，再梳理一次代码。
+逻辑流程上，每一个语句会被默认当作事务提交，因为 autocommit=1，如果使用 begin / commit 则会关闭自动提交并提交上一次的语句，并只能在 commit 时候隐式提交下一次的语句。
+
+context.go 内定义了 session 作为 Context interface 的所有接口动作，从这里比较容易看出 session 一个生命周期拥有的动作。
+client connection 和 session 的连接层次关系：
+cliConn -> QueryCtx -> SessionVars() -> session -> sessionVars -> txnCxt
+
+事务应该是以每个 txn(transaction 的缩写吧?) 为上下文的，所以应该在 txn 本身的产生和注销的位置打日志比较容易观察整个流程.
+使用 vscode 可以直接 attach 到 tidb-server 的进程，也可以帮助验证。
+
+最后在这里加入代码可以在日志内找到.
+
+```go
+func (s *session) NewTxn(ctx context.Context) error {
+	if s.txn.Valid() {
+		txnID := s.txn.StartTS()
+		logutil.Logger(ctx).Info("old txn is committed.")
+		err := s.CommitTxn(ctx)
+		if err != nil {
+			return err
+		}
+```
+结果
+![avatar](./result.png)
 
 ## 后验总结
 
@@ -118,3 +201,17 @@ make -j8
 [总体架构概述](https://pingcap.com/blog-cn/how-do-we-build-tidb/)
 
 [计算模型概述](https://pingcap.com/blog-cn/tidb-internal-2/)
+
+[事务概述](https://docs.pingcap.com/zh/tidb/stable/transaction-overview)
+
+### 疑问
+在执行下列语句时，表现不太符合预期
+```sql
+CREATE TABLE T (I INT KEY);
+INSERT INTO T VALUES (1);
+BEGIN OPTIMISTIC;
+INSERT INTO T VALUES (1);  -- 此行会立刻报错, 乐观锁应该是 commit 时候报错.
+COMMIT;
+```
+
+而且操作过程中，有时候 begin； 执行会有 NewTxn 的日志，有时候就什么都没有，这应该和事务模型本身以及 auto commit 有关系，但是暂时还没有搞的特别清楚。
